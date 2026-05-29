@@ -7,6 +7,7 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using Microsoft.Win32;
 using ClashXW.Models;
 using ClashXW.Native;
 using ClashXW.Services;
@@ -31,6 +32,7 @@ namespace ClashXW
         private bool _isSystemProxyEnabled;
         private bool _isTunEnabled;
         private bool _isPowerResumeRecoveryInProgress;
+        private bool _isPowerSuspended;
         private int _powerTransitionGeneration;
         private bool _isExiting;
 
@@ -51,6 +53,8 @@ namespace ClashXW
             _messageWindow.ThemeChanged += UpdateTrayIcon;
             _messageWindow.PowerSuspending += OnPowerSuspending;
             _messageWindow.PowerResumed += OnPowerResumed;
+            SystemEvents.PowerModeChanged += OnSystemPowerModeChanged;
+            Logger.Info("Subscribed to SystemEvents.PowerModeChanged");
 
             // Create notify icon
             _notifyIcon = new NotifyIcon
@@ -201,32 +205,65 @@ namespace ClashXW
             }
         }
 
-        private void OnPowerSuspending()
+        private void OnPowerSuspending() => OnPowerSuspending("WM_POWERBROADCAST");
+
+        private void OnPowerResumed() => OnPowerResumed("WM_POWERBROADCAST");
+
+        private void OnSystemPowerModeChanged(object sender, PowerModeChangedEventArgs e)
+        {
+            Logger.Info($"SystemEvents.PowerModeChanged received, mode={e.Mode}");
+
+            switch (e.Mode)
+            {
+                case PowerModes.Suspend:
+                    OnPowerSuspending("SystemEvents.PowerModeChanged");
+                    break;
+                case PowerModes.Resume:
+                    OnPowerResumed("SystemEvents.PowerModeChanged");
+                    break;
+                case PowerModes.StatusChange:
+                    break;
+            }
+        }
+
+        private void OnPowerSuspending(string source)
         {
             if (_isExiting || _clashProcessService == null) return;
 
+            if (_isPowerSuspended)
+            {
+                Logger.Info($"Ignoring duplicate power suspend from {source}; generation={_powerTransitionGeneration}");
+                return;
+            }
+
+            _isPowerSuspended = true;
             _powerTransitionGeneration++;
             _isPowerResumeRecoveryInProgress = false;
             DisposeApiService();
 
             try
             {
-                Logger.Info($"Power suspend/hibernate requested; generation={_powerTransitionGeneration}; stopping Clash core before the system sleeps");
+                Logger.Info($"Power suspend/hibernate requested from {source}; generation={_powerTransitionGeneration}; stopping Clash core before the system sleeps");
                 _clashProcessService.Stop();
             }
             catch (Exception ex)
             {
-                Logger.Warn($"Failed to stop Clash core before suspend/hibernate: {ex.Message}");
+                Logger.Warn($"Failed to stop Clash core before suspend/hibernate from {source}: {ex.Message}");
             }
         }
 
-        private async void OnPowerResumed()
+        private async void OnPowerResumed(string source)
         {
             if (_isExiting || _clashProcessService == null || _isPowerResumeRecoveryInProgress) return;
 
+            if (!_isPowerSuspended)
+            {
+                Logger.Info($"Power resume received from {source} without a tracked suspend; refreshing Clash core/API state");
+            }
+
             _isPowerResumeRecoveryInProgress = true;
             var recoveryGeneration = _powerTransitionGeneration;
-            Logger.Info($"Power resume recovery scheduled; generation={recoveryGeneration}; delay={PowerResumeRestartDelay.TotalMilliseconds:0}ms");
+            Logger.Info($"Power resume recovery scheduled from {source}; generation={recoveryGeneration}; delay={PowerResumeRestartDelay.TotalMilliseconds:0}ms");
 
             try
             {
@@ -236,11 +273,11 @@ namespace ClashXW
 
                 if (_isExiting || recoveryGeneration != _powerTransitionGeneration)
                 {
-                    Logger.Info($"Skipping stale power resume recovery; recoveryGeneration={recoveryGeneration}; currentGeneration={_powerTransitionGeneration}; isExiting={_isExiting}");
+                    Logger.Info($"Skipping stale power resume recovery from {source}; recoveryGeneration={recoveryGeneration}; currentGeneration={_powerTransitionGeneration}; isExiting={_isExiting}");
                     return;
                 }
 
-                Logger.Info($"Power resume detected; generation={recoveryGeneration}; restarting Clash core");
+                Logger.Info($"Power resume detected from {source}; generation={recoveryGeneration}; restarting Clash core");
                 if (!StartClashCore())
                 {
                     return;
@@ -248,16 +285,17 @@ namespace ClashXW
 
                 InitializeApiService();
                 await RefreshCachedDataAsync();
-                Logger.Info($"Power resume recovery completed; generation={recoveryGeneration}");
+                Logger.Info($"Power resume recovery completed from {source}; generation={recoveryGeneration}");
             }
             catch (Exception ex)
             {
-                Logger.Warn($"Failed to refresh state after power resume: {ex.Message}");
+                Logger.Warn($"Failed to refresh state after power resume from {source}: {ex.Message}");
             }
             finally
             {
                 if (recoveryGeneration == _powerTransitionGeneration)
                 {
+                    _isPowerSuspended = false;
                     _isPowerResumeRecoveryInProgress = false;
                 }
             }
@@ -651,6 +689,7 @@ namespace ClashXW
         private void OnExit()
         {
             _isExiting = true;
+            SystemEvents.PowerModeChanged -= OnSystemPowerModeChanged;
             // Check if system proxy was enabled and disable it
             if (_cachedConfigs != null)
             {
@@ -691,6 +730,7 @@ namespace ClashXW
             {
                 _notifyIcon.Dispose();
                 DisposeApiService();
+                SystemEvents.PowerModeChanged -= OnSystemPowerModeChanged;
                 _messageWindow.ThemeChanged -= UpdateTrayIcon;
                 _messageWindow.PowerSuspending -= OnPowerSuspending;
                 _messageWindow.PowerResumed -= OnPowerResumed;
