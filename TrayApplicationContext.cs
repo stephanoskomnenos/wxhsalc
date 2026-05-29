@@ -725,7 +725,6 @@ namespace ClashXW
         private const int WM_SETTINGCHANGE = 0x001A;
         private const int WM_POWERBROADCAST = 0x0218;
         private const int PBT_APMSUSPEND = 0x0004;
-        private const int PBT_APMPOWERSTATUSCHANGE = 0x000A;
         private const int PBT_APMRESUMEAUTOMATIC = 0x0012;
         private const int PBT_APMRESUMECRITICAL = 0x0006;
         private const int PBT_APMRESUMESUSPEND = 0x0007;
@@ -826,7 +825,6 @@ namespace ClashXW
             return powerEvent switch
             {
                 PBT_APMSUSPEND => nameof(PBT_APMSUSPEND),
-                PBT_APMPOWERSTATUSCHANGE => nameof(PBT_APMPOWERSTATUSCHANGE),
                 PBT_APMRESUMECRITICAL => nameof(PBT_APMRESUMECRITICAL),
                 PBT_APMRESUMEAUTOMATIC => nameof(PBT_APMRESUMEAUTOMATIC),
                 PBT_APMRESUMESUSPEND => nameof(PBT_APMRESUMESUSPEND),
