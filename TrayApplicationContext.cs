@@ -30,10 +30,15 @@ namespace ClashXW
         private DashboardForm? _dashboardForm;
         private bool _isSystemProxyEnabled;
         private bool _isTunEnabled;
+        private bool _isPowerResumeRecoveryInProgress;
+        private bool _isPowerSuspended;
+        private int _powerTransitionGeneration;
+        private bool _isExiting;
 
         public TrayApplicationContext()
         {
             ConfigManager.EnsureDefaultConfigExists();
+            Logger.Info($"ClashXW starting. LogFile={Logger.CurrentLogFilePath}");
 
             _executablePath = Path.Combine(AppContext.BaseDirectory, "ClashAssets", "clash.exe");
             _currentConfigPath = ConfigManager.GetCurrentConfigPath();
@@ -45,6 +50,8 @@ namespace ClashXW
             // Create a message window for menu handling
             _messageWindow = new MessageWindow();
             _messageWindow.ThemeChanged += UpdateTrayIcon;
+            _messageWindow.PowerSuspending += OnPowerSuspending;
+            _messageWindow.PowerResumed += OnPowerResumed;
 
             // Create notify icon
             _notifyIcon = new NotifyIcon
@@ -55,8 +62,10 @@ namespace ClashXW
             };
             _notifyIcon.MouseUp += OnNotifyIconMouseUp;
 
-            StartClashCore();
-            InitializeApiService();
+            if (StartClashCore(exitOnFailure: true))
+            {
+                InitializeApiService();
+            }
         }
 
         private Icon LoadIcon()
@@ -165,24 +174,120 @@ namespace ClashXW
             }
         }
 
-        private void StartClashCore()
+        private static readonly TimeSpan PowerResumeRestartDelay = TimeSpan.FromSeconds(2);
+
+        private bool StartClashCore(bool exitOnFailure = false)
         {
-            if (_clashProcessService == null) return;
+            if (_clashProcessService == null) return false;
 
             try
             {
                 _clashProcessService.Start(_currentConfigPath);
+                return true;
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"Failed to start Clash process:\n{ex.Message}", "Error",
-                    MessageBoxButtons.OK, MessageBoxIcon.Error);
-                ExitThread();
+                Logger.Error("Failed to start Clash core", ex);
+
+                if (exitOnFailure)
+                {
+                    MessageBox.Show($"Failed to start Clash process:\n{ex.Message}", "Error",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    ExitThread();
+                }
+                else
+                {
+                    ShowBalloonTip("Error", $"Failed to recover Clash core after resume: {ex.Message}", ToolTipIcon.Error);
+                }
+
+                return false;
+            }
+        }
+
+        private void OnPowerSuspending()
+        {
+            if (_isExiting || _clashProcessService == null) return;
+
+            if (_isPowerSuspended)
+            {
+                Logger.Info($"Ignoring duplicate power suspend; generation={_powerTransitionGeneration}");
+                return;
+            }
+
+            _isPowerSuspended = true;
+            _powerTransitionGeneration++;
+            _isPowerResumeRecoveryInProgress = false;
+            DisposeApiService();
+
+            try
+            {
+                Logger.Info($"Power suspend/hibernate requested; generation={_powerTransitionGeneration}; stopping Clash core before the system sleeps");
+                _clashProcessService.Stop();
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn($"Failed to stop Clash core before suspend/hibernate: {ex.Message}");
+            }
+        }
+
+        private async void OnPowerResumed()
+        {
+            await RecoverAfterPowerResumeAsync();
+        }
+
+        private async Task RecoverAfterPowerResumeAsync()
+        {
+            if (_isExiting || _clashProcessService == null || _isPowerResumeRecoveryInProgress) return;
+
+            if (!_isPowerSuspended)
+            {
+                Logger.Info("Power resume received without a tracked suspend; refreshing Clash core/API state");
+            }
+
+            _isPowerResumeRecoveryInProgress = true;
+            var recoveryGeneration = _powerTransitionGeneration;
+            Logger.Info($"Power resume recovery scheduled; generation={recoveryGeneration}; delay={PowerResumeRestartDelay.TotalMilliseconds:0}ms");
+
+            try
+            {
+                // Give Windows a short moment to restore network adapters and routing before
+                // restarting mihomo/Clash and refreshing its API state.
+                await Task.Delay(PowerResumeRestartDelay);
+
+                if (_isExiting || recoveryGeneration != _powerTransitionGeneration)
+                {
+                    Logger.Info($"Skipping stale power resume recovery; recoveryGeneration={recoveryGeneration}; currentGeneration={_powerTransitionGeneration}; isExiting={_isExiting}");
+                    return;
+                }
+
+                Logger.Info($"Power resume detected; generation={recoveryGeneration}; restarting Clash core");
+                if (!StartClashCore())
+                {
+                    return;
+                }
+
+                InitializeApiService();
+                await RefreshCachedDataAsync();
+                Logger.Info($"Power resume recovery completed; generation={recoveryGeneration}");
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn($"Failed to refresh state after power resume: {ex.Message}");
+            }
+            finally
+            {
+                if (recoveryGeneration == _powerTransitionGeneration)
+                {
+                    _isPowerSuspended = false;
+                    _isPowerResumeRecoveryInProgress = false;
+                }
             }
         }
 
         private void InitializeApiService()
         {
+            DisposeApiService();
+
             var apiDetails = ConfigManager.ReadApiDetails(_currentConfigPath);
             if (apiDetails != null)
             {
@@ -190,10 +295,15 @@ namespace ClashXW
             }
             else
             {
-                _apiService = null;
                 MessageBox.Show($"Failed to read API details from {_currentConfigPath}. API features will be disabled.",
                     "Config Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
+        }
+
+        private void DisposeApiService()
+        {
+            _apiService?.Dispose();
+            _apiService = null;
         }
 
         private async void OnNotifyIconMouseUp(object? sender, MouseEventArgs e)
@@ -208,12 +318,13 @@ namespace ClashXW
 
         private async Task RefreshCachedDataAsync()
         {
-            if (_apiService == null) return;
+            var apiService = _apiService;
+            if (apiService == null) return;
 
             try
             {
-                var configsTask = _apiService.GetConfigsAsync();
-                var proxiesTask = _apiService.GetProxiesAsync();
+                var configsTask = apiService.GetConfigsAsync();
+                var proxiesTask = apiService.GetProxiesAsync();
 
                 await Task.WhenAll(configsTask, proxiesTask);
 
@@ -246,7 +357,7 @@ namespace ClashXW
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"Failed to fetch API data: {ex.Message}");
+                Logger.Warn($"Failed to fetch API data: {ex.Message}");
             }
         }
 
@@ -281,11 +392,12 @@ namespace ClashXW
 
         private async void OnModeSelected(string mode)
         {
-            if (_apiService == null) return;
+            var apiService = _apiService;
+            if (apiService == null) return;
 
             try
             {
-                await _apiService.UpdateModeAsync(mode);
+                await apiService.UpdateModeAsync(mode);
             }
             catch (Exception ex)
             {
@@ -295,11 +407,12 @@ namespace ClashXW
 
         private async void OnProxyNodeSelected(string groupName, string nodeName)
         {
-            if (_apiService == null) return;
+            var apiService = _apiService;
+            if (apiService == null) return;
 
             try
             {
-                await _apiService.SelectProxyNodeAsync(groupName, nodeName);
+                await apiService.SelectProxyNodeAsync(groupName, nodeName);
             }
             catch (Exception ex)
             {
@@ -309,7 +422,8 @@ namespace ClashXW
 
         private async void OnTestGroupLatency(string groupName)
         {
-            if (_apiService == null) return;
+            var apiService = _apiService;
+            if (apiService == null) return;
 
             try
             {
@@ -318,14 +432,14 @@ namespace ClashXW
 
                 if (IsAutoGroup(group))
                 {
-                    await _apiService.TestGroupLatencyAsync(groupName);
+                    await apiService.TestGroupLatencyAsync(groupName);
                 }
                 else
                 {
                     var tasks = new System.Collections.Generic.List<Task>();
                     foreach (var nodeName in group.All ?? (IReadOnlyList<string>)Array.Empty<string>())
                     {
-                        tasks.Add(_apiService.TestProxyLatencyAsync(nodeName));
+                        tasks.Add(apiService.TestProxyLatencyAsync(nodeName));
                     }
                     await Task.WhenAll(tasks);
                 }
@@ -346,11 +460,12 @@ namespace ClashXW
 
         private async void OnSystemProxyToggle(bool enable)
         {
-            if (_apiService == null) return;
+            var apiService = _apiService;
+            if (apiService == null) return;
 
             try
             {
-                var configs = await _apiService.GetConfigsAsync();
+                var configs = await apiService.GetConfigsAsync();
                 if (configs == null) return;
 
                 var proxyAddress = GetProxyAddress(configs);
@@ -380,14 +495,15 @@ namespace ClashXW
 
         private async void OnTunModeToggle(bool enable)
         {
-            if (_apiService == null) return;
+            var apiService = _apiService;
+            if (apiService == null) return;
 
             try
             {
-                await _apiService.UpdateTunModeAsync(enable);
+                await apiService.UpdateTunModeAsync(enable);
 
                 // Verify actual state after toggle
-                var configs = await _apiService.GetConfigsAsync();
+                var configs = await apiService.GetConfigsAsync();
                 var actualTunState = configs?.Tun?.Enable ?? false;
 
                 if (actualTunState != enable)
@@ -441,7 +557,8 @@ namespace ClashXW
 
         private async void OnTestLatency()
         {
-            if (_apiService == null || _cachedProxies?.Proxies == null) return;
+            var apiService = _apiService;
+            if (apiService == null || _cachedProxies?.Proxies == null) return;
 
             try
             {
@@ -453,19 +570,19 @@ namespace ClashXW
                     {
                         if (IsAutoGroup(proxy))
                         {
-                            latencyTasks.Add(_apiService.TestGroupLatencyAsync(proxy.Name));
+                            latencyTasks.Add(apiService.TestGroupLatencyAsync(proxy.Name));
                         }
                         else
                         {
                             foreach (var nodeName in proxy.All)
                             {
-                                latencyTasks.Add(_apiService.TestProxyLatencyAsync(nodeName));
+                                latencyTasks.Add(apiService.TestProxyLatencyAsync(nodeName));
                             }
                         }
                     }
                     else
                     {
-                        latencyTasks.Add(_apiService.TestProxyLatencyAsync(proxy.Name));
+                        latencyTasks.Add(apiService.TestProxyLatencyAsync(proxy.Name));
                     }
                 }
 
@@ -480,11 +597,12 @@ namespace ClashXW
 
         private async void OnConfigSelected(string newPath)
         {
-            if (_apiService == null) return;
+            var apiService = _apiService;
+            if (apiService == null) return;
 
             try
             {
-                await _apiService.ReloadConfigAsync(newPath);
+                await apiService.ReloadConfigAsync(newPath);
                 _currentConfigPath = newPath;
                 ConfigManager.SetCurrentConfigPath(newPath);
                 InitializeApiService();
@@ -497,11 +615,12 @@ namespace ClashXW
 
         private async void OnReloadConfig()
         {
-            if (_apiService == null || string.IsNullOrEmpty(_currentConfigPath)) return;
+            var apiService = _apiService;
+            if (apiService == null || string.IsNullOrEmpty(_currentConfigPath)) return;
 
             try
             {
-                await _apiService.ReloadConfigAsync(_currentConfigPath);
+                await apiService.ReloadConfigAsync(_currentConfigPath);
                 ShowBalloonTip("Success", "Configuration reloaded", ToolTipIcon.Info);
             }
             catch (Exception ex)
@@ -552,6 +671,7 @@ namespace ClashXW
 
         private void OnExit()
         {
+            _isExiting = true;
             // Check if system proxy was enabled and disable it
             if (_cachedConfigs != null)
             {
@@ -562,10 +682,11 @@ namespace ClashXW
                 }
             }
 
+            DisposeApiService();
             _clashProcessService?.Dispose();
             _notifyIcon.Visible = false;
             _notifyIcon.Dispose();
-            _messageWindow.DestroyHandle();
+            _messageWindow.Dispose();
             ExitThread();
         }
 
@@ -590,7 +711,11 @@ namespace ClashXW
             if (disposing)
             {
                 _notifyIcon.Dispose();
-                _messageWindow.DestroyHandle();
+                DisposeApiService();
+                _messageWindow.ThemeChanged -= UpdateTrayIcon;
+                _messageWindow.PowerSuspending -= OnPowerSuspending;
+                _messageWindow.PowerResumed -= OnPowerResumed;
+                _messageWindow.Dispose();
                 _clashProcessService?.Dispose();
             }
             base.Dispose(disposing);
@@ -602,11 +727,21 @@ namespace ClashXW
     /// Note: Message-only windows (HWND_MESSAGE) do NOT receive broadcast messages like
     /// WM_SETTINGCHANGE, so we use a regular hidden window instead.
     /// </summary>
-    internal class MessageWindow : NativeWindow
+    internal class MessageWindow : NativeWindow, IDisposable
     {
         private const int WM_SETTINGCHANGE = 0x001A;
+        private const int WM_POWERBROADCAST = 0x0218;
+        private const int PBT_APMSUSPEND = 0x0004;
+        private const int PBT_APMRESUMEAUTOMATIC = 0x0012;
+        private const int PBT_APMRESUMECRITICAL = 0x0006;
+        private const int PBT_APMRESUMESUSPEND = 0x0007;
+
+        private IntPtr _suspendResumeNotificationHandle;
+        private bool _disposed;
 
         public event Action? ThemeChanged;
+        public event Action? PowerSuspending;
+        public event Action? PowerResumed;
 
         public MessageWindow()
         {
@@ -616,6 +751,48 @@ namespace ClashXW
                 Style = 0, // Not visible
             });
             Logger.Info($"MessageWindow created: Handle={Handle}");
+            RegisterSuspendResumeNotifications();
+        }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+
+            _disposed = true;
+            UnregisterSuspendResumeNotifications();
+            DestroyHandle();
+            GC.SuppressFinalize(this);
+        }
+
+        private void RegisterSuspendResumeNotifications()
+        {
+            _suspendResumeNotificationHandle = NativeMethods.RegisterSuspendResumeNotification(
+                Handle,
+                NativeMethods.DEVICE_NOTIFY_WINDOW_HANDLE);
+
+            if (_suspendResumeNotificationHandle == IntPtr.Zero)
+            {
+                Logger.Warn($"RegisterSuspendResumeNotification failed: {Marshal.GetLastWin32Error()}");
+                return;
+            }
+
+            Logger.Info($"Registered suspend/resume notifications: Handle={_suspendResumeNotificationHandle}");
+        }
+
+        private void UnregisterSuspendResumeNotifications()
+        {
+            if (_suspendResumeNotificationHandle == IntPtr.Zero) return;
+
+            if (!NativeMethods.UnregisterSuspendResumeNotification(_suspendResumeNotificationHandle))
+            {
+                Logger.Warn($"UnregisterSuspendResumeNotification failed: {Marshal.GetLastWin32Error()}");
+            }
+            else
+            {
+                Logger.Info($"Unregistered suspend/resume notifications: Handle={_suspendResumeNotificationHandle}");
+            }
+
+            _suspendResumeNotificationHandle = IntPtr.Zero;
         }
 
         protected override void WndProc(ref Message m)
@@ -630,7 +807,36 @@ namespace ClashXW
                     ThemeChanged?.Invoke();
                 }
             }
+            else if (m.Msg == WM_POWERBROADCAST)
+            {
+                var powerEvent = m.WParam.ToInt32();
+                Logger.Info($"MessageWindow: WM_POWERBROADCAST received, event=0x{powerEvent:X} ({GetPowerEventName(powerEvent)})");
+
+                switch (powerEvent)
+                {
+                    case PBT_APMSUSPEND:
+                        PowerSuspending?.Invoke();
+                        break;
+                    case PBT_APMRESUMECRITICAL:
+                    case PBT_APMRESUMEAUTOMATIC:
+                    case PBT_APMRESUMESUSPEND:
+                        PowerResumed?.Invoke();
+                        break;
+                }
+            }
             base.WndProc(ref m);
+        }
+
+        private static string GetPowerEventName(int powerEvent)
+        {
+            return powerEvent switch
+            {
+                PBT_APMSUSPEND => nameof(PBT_APMSUSPEND),
+                PBT_APMRESUMECRITICAL => nameof(PBT_APMRESUMECRITICAL),
+                PBT_APMRESUMEAUTOMATIC => nameof(PBT_APMRESUMEAUTOMATIC),
+                PBT_APMRESUMESUSPEND => nameof(PBT_APMRESUMESUSPEND),
+                _ => "Unknown"
+            };
         }
     }
 }

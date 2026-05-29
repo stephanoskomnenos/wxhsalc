@@ -9,7 +9,7 @@ using ClashXW.Models;
 
 namespace ClashXW.Services
 {
-    public class ClashApiService
+    public sealed class ClashApiService : IDisposable
     {
         private readonly HttpClient _httpClient;
         private readonly string? _apiBaseUrl;
@@ -110,6 +110,11 @@ namespace ClashXW.Services
             {
                 // Ignore errors - latency test failures are not critical
             }
+        }
+
+        public void Dispose()
+        {
+            _httpClient.Dispose();
         }
     }
 }
