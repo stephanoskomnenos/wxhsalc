@@ -9,6 +9,9 @@ namespace ClashXW.Services
 {
     public class ClashProcessService : IDisposable
     {
+        private const int StopWaitMilliseconds = 1500;
+
+        private readonly object _syncRoot = new();
         private Process? _clashProcess;
         private readonly string _executablePath;
         private IntPtr _jobHandle;
@@ -20,58 +23,95 @@ namespace ClashXW.Services
 
         public void Start(string configPath)
         {
-            if (string.IsNullOrEmpty(_executablePath) || !File.Exists(_executablePath))
+            lock (_syncRoot)
             {
-                throw new FileNotFoundException($"Clash executable not found at: {_executablePath}");
-            }
-
-            try
-            {
-                var assetsDir = Path.GetDirectoryName(_executablePath);
-                var startInfo = new ProcessStartInfo
+                if (IsRunningUnsafe)
                 {
-                    FileName = _executablePath,
-                    Arguments = $"-d \"{assetsDir}\" -f \"{configPath}\"",
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                };
+                    Logger.Info("Clash core is already running; start request ignored");
+                    return;
+                }
 
-                // Add config directory to SAFE_PATHS so Clash accepts config files from there
-                var existingSafePaths = Environment.GetEnvironmentVariable("SAFE_PATHS") ?? "";
-                var configDir = ConfigManager.ConfigDir;
-                var safePaths = string.IsNullOrEmpty(existingSafePaths)
-                    ? configDir
-                    : $"{existingSafePaths},{configDir}";
-                startInfo.Environment["SAFE_PATHS"] = safePaths;
+                _clashProcess?.Dispose();
+                _clashProcess = null;
 
-                _clashProcess = new Process { StartInfo = startInfo };
-                _clashProcess.Start();
-                AssignToLifetimeJob(_clashProcess);
-            }
-            catch (Exception ex)
-            {
-                CleanupFailedStart();
-                throw new InvalidOperationException($"Failed to start Clash process: {ex.Message}", ex);
+                if (string.IsNullOrEmpty(_executablePath) || !File.Exists(_executablePath))
+                {
+                    throw new FileNotFoundException($"Clash executable not found at: {_executablePath}");
+                }
+
+                try
+                {
+                    var assetsDir = Path.GetDirectoryName(_executablePath);
+                    var startInfo = new ProcessStartInfo
+                    {
+                        FileName = _executablePath,
+                        Arguments = $"-d \"{assetsDir}\" -f \"{configPath}\"",
+                        UseShellExecute = false,
+                        CreateNoWindow = true
+                    };
+
+                    // Add config directory to SAFE_PATHS so Clash accepts config files from there
+                    var existingSafePaths = Environment.GetEnvironmentVariable("SAFE_PATHS") ?? "";
+                    var configDir = ConfigManager.ConfigDir;
+                    var safePaths = string.IsNullOrEmpty(existingSafePaths)
+                        ? configDir
+                        : $"{existingSafePaths},{configDir}";
+                    startInfo.Environment["SAFE_PATHS"] = safePaths;
+
+                    Logger.Info($"Starting Clash core: exe={_executablePath}, config={configPath}");
+                    _clashProcess = new Process { StartInfo = startInfo };
+                    _clashProcess.Start();
+                    Logger.Info($"Started Clash core PID={_clashProcess.Id}");
+                    AssignToLifetimeJob(_clashProcess);
+                }
+                catch (Exception ex)
+                {
+                    CleanupFailedStart();
+                    throw new InvalidOperationException($"Failed to start Clash process: {ex.Message}", ex);
+                }
             }
         }
 
         public void Stop()
         {
-            ReleaseLifetimeJob();
-
-            if (_clashProcess != null && !_clashProcess.HasExited)
+            lock (_syncRoot)
             {
-                KillProcessBestEffort(_clashProcess, "stop");
+                if (_clashProcess != null)
+                {
+                    var processId = GetProcessIdBestEffort(_clashProcess);
+                    Logger.Info($"Stopping Clash core PID={processId?.ToString() ?? "unknown"}");
+
+                    if (!_clashProcess.HasExited)
+                    {
+                        KillProcessBestEffort(_clashProcess, "stop");
+                    }
+
+                    _clashProcess.Dispose();
+                    _clashProcess = null;
+                    Logger.Info($"Stopped Clash core PID={processId?.ToString() ?? "unknown"}");
+                }
+
+                ReleaseLifetimeJob();
             }
         }
 
-        public bool IsRunning => _clashProcess != null && !_clashProcess.HasExited;
+        public bool IsRunning
+        {
+            get
+            {
+                lock (_syncRoot)
+                {
+                    return IsRunningUnsafe;
+                }
+            }
+        }
 
         public void Dispose()
         {
             Stop();
-            _clashProcess?.Dispose();
         }
+
+        private bool IsRunningUnsafe => _clashProcess != null && !_clashProcess.HasExited;
 
         private void AssignToLifetimeJob(Process process)
         {
@@ -148,16 +188,39 @@ namespace ClashXW.Services
 
         private void KillProcessBestEffort(Process process, string context)
         {
+            var processId = GetProcessIdBestEffort(process);
+
             try
             {
                 if (!process.HasExited)
                 {
+                    Logger.Info($"Killing Clash core PID={processId?.ToString() ?? "unknown"} during {context}");
                     process.Kill(entireProcessTree: true);
+                    if (process.WaitForExit(StopWaitMilliseconds))
+                    {
+                        Logger.Info($"Clash core PID={processId?.ToString() ?? "unknown"} exited during {context}");
+                    }
+                    else
+                    {
+                        Logger.Warn($"Clash core PID={processId?.ToString() ?? "unknown"} did not exit within {StopWaitMilliseconds}ms during {context}");
+                    }
                 }
             }
             catch (Exception ex)
             {
-                Logger.Warn($"Failed to kill Clash core during {context}: {ex.Message}");
+                Logger.Warn($"Failed to kill Clash core PID={processId?.ToString() ?? "unknown"} during {context}: {ex.Message}");
+            }
+        }
+
+        private static int? GetProcessIdBestEffort(Process process)
+        {
+            try
+            {
+                return process.Id;
+            }
+            catch
+            {
+                return null;
             }
         }
 

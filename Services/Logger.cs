@@ -9,6 +9,8 @@ namespace ClashXW.Services
         private static readonly object Lock = new();
         private const long MaxLogSize = 1024 * 1024; // 1 MB
 
+        public static string CurrentLogFilePath => LogFilePath;
+
         public static void Info(string message) => Write("INFO", message);
         public static void Warn(string message) => Write("WARN", message);
         public static void Error(string message) => Write("ERROR", message);
