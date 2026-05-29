@@ -704,7 +704,7 @@ namespace ClashXW
             _clashProcessService?.Dispose();
             _notifyIcon.Visible = false;
             _notifyIcon.Dispose();
-            _messageWindow.DestroyHandle();
+            _messageWindow.Dispose();
             ExitThread();
         }
 
@@ -734,7 +734,7 @@ namespace ClashXW
                 _messageWindow.ThemeChanged -= UpdateTrayIcon;
                 _messageWindow.PowerSuspending -= OnPowerSuspending;
                 _messageWindow.PowerResumed -= OnPowerResumed;
-                _messageWindow.DestroyHandle();
+                _messageWindow.Dispose();
                 _clashProcessService?.Dispose();
             }
             base.Dispose(disposing);
@@ -746,7 +746,7 @@ namespace ClashXW
     /// Note: Message-only windows (HWND_MESSAGE) do NOT receive broadcast messages like
     /// WM_SETTINGCHANGE, so we use a regular hidden window instead.
     /// </summary>
-    internal class MessageWindow : NativeWindow
+    internal class MessageWindow : NativeWindow, IDisposable
     {
         private const int WM_SETTINGCHANGE = 0x001A;
         private const int WM_POWERBROADCAST = 0x0218;
@@ -754,6 +754,9 @@ namespace ClashXW
         private const int PBT_APMRESUMEAUTOMATIC = 0x0012;
         private const int PBT_APMRESUMECRITICAL = 0x0006;
         private const int PBT_APMRESUMESUSPEND = 0x0007;
+
+        private IntPtr _suspendResumeNotificationHandle;
+        private bool _disposed;
 
         public event Action? ThemeChanged;
         public event Action? PowerSuspending;
@@ -767,6 +770,48 @@ namespace ClashXW
                 Style = 0, // Not visible
             });
             Logger.Info($"MessageWindow created: Handle={Handle}");
+            RegisterSuspendResumeNotifications();
+        }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+
+            _disposed = true;
+            UnregisterSuspendResumeNotifications();
+            DestroyHandle();
+            GC.SuppressFinalize(this);
+        }
+
+        private void RegisterSuspendResumeNotifications()
+        {
+            _suspendResumeNotificationHandle = NativeMethods.RegisterSuspendResumeNotification(
+                Handle,
+                NativeMethods.DEVICE_NOTIFY_WINDOW_HANDLE);
+
+            if (_suspendResumeNotificationHandle == IntPtr.Zero)
+            {
+                Logger.Warn($"RegisterSuspendResumeNotification failed: {Marshal.GetLastWin32Error()}");
+                return;
+            }
+
+            Logger.Info($"Registered suspend/resume notifications: Handle={_suspendResumeNotificationHandle}");
+        }
+
+        private void UnregisterSuspendResumeNotifications()
+        {
+            if (_suspendResumeNotificationHandle == IntPtr.Zero) return;
+
+            if (!NativeMethods.UnregisterSuspendResumeNotification(_suspendResumeNotificationHandle))
+            {
+                Logger.Warn($"UnregisterSuspendResumeNotification failed: {Marshal.GetLastWin32Error()}");
+            }
+            else
+            {
+                Logger.Info($"Unregistered suspend/resume notifications: Handle={_suspendResumeNotificationHandle}");
+            }
+
+            _suspendResumeNotificationHandle = IntPtr.Zero;
         }
 
         protected override void WndProc(ref Message m)

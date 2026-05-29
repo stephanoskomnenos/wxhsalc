@@ -137,6 +137,13 @@ namespace ClashXW.Native
         [DllImport("user32.dll", SetLastError = true)]
         internal static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 
+        [DllImport("user32.dll", SetLastError = true)]
+        internal static extern IntPtr RegisterSuspendResumeNotification(IntPtr hRecipient, uint flags);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool UnregisterSuspendResumeNotification(IntPtr handle);
+
         // Hooks
         [DllImport("user32.dll", SetLastError = true)]
         internal static extern IntPtr SetWindowsHookEx(int idHook, HookProc lpfn, IntPtr hMod, uint dwThreadId);
@@ -207,6 +214,9 @@ namespace ClashXW.Native
         // Virtual key codes
         internal const int VK_CONTROL = 0x11;
         internal const int VK_MENU = 0x12; // Alt key
+
+        // Power notification recipient flags
+        internal const uint DEVICE_NOTIFY_WINDOW_HANDLE = 0x00000000;
 
         // Job object limit flags
         internal const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
